@@ -1,0 +1,13 @@
+{
+  "name": "n8n-nodes-flowdex",
+  "version": "0.1.0",
+  "description": "FlowDex token-efficient LLM router node for n8n",
+  "main": "dist/main.js",
+  "types": "dist/main.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
