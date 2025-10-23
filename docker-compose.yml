@@ -1,0 +1,23 @@
+version: "3.8"
+services:
+  api:
+    build: ./server
+    ports:
+      - "${FLOWDEX_PORT:-8787}:8787"
+    environment:
+      - FLOWDEX_PORT=8787
+      - FLOWDEX_CACHE_DIR=/data/cache
+      - FLOWDEX_MODEL=${FLOWDEX_MODEL:-anthropic/claude-3-5-sonnet}
+      - FLOWDEX_MAX_TOKENS=${FLOWDEX_MAX_TOKENS:-6000}
+      - FLOWDEX_BUDGET_SYSTEM=${FLOWDEX_BUDGET_SYSTEM:-1000}
+      - FLOWDEX_BUDGET_CONTEXT=${FLOWDEX_BUDGET_CONTEXT:-2500}
+      - FLOWDEX_BUDGET_USER=${FLOWDEX_BUDGET_USER:-1500}
+      - FLOWDEX_BUDGET_TOOLS=${FLOWDEX_BUDGET_TOOLS:-1000}
+    volumes:
+      - ./_data:/data
+    depends_on:
+      - redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
