@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import redis
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 
@@ -24,6 +24,7 @@ MEMORY_KEY_PREFIX = "flowdex:memory:"
 MEMORY_INDEX_KEY = "flowdex:memory:index"
 TOOLS_KEY = "flowdex:tools"
 RUNS_KEY = "flowdex:runs"
+API_KEY = os.environ.get("FLOWDEX_API_KEY")
 
 
 def get_redis() -> redis.Redis:
@@ -50,6 +51,24 @@ def get_redis() -> redis.Redis:
     return client
 
 
+@app.get("/health")
+def health_check():
+    """Return the health status of the API service and backing Redis."""
+
+    try:
+        client = get_redis()
+        client.ping()
+        redis_ok = True
+    except Exception:  # pragma: no cover - defensive
+        redis_ok = False
+
+    return {
+        "status": "ok" if redis_ok else "degraded",
+        "redis_connected": redis_ok,
+        "version": app.version,
+    }
+
+
 class Budget(BaseModel):
     system: int = Field(default=int(os.environ.get("FLOWDEX_BUDGET_SYSTEM", 1000)))
     context: int = Field(default=int(os.environ.get("FLOWDEX_BUDGET_CONTEXT", 2500)))
@@ -67,6 +86,25 @@ class InferRequest(BaseModel):
     model: str = os.environ.get("FLOWDEX_MODEL", "anthropic/claude-3-5-sonnet")
     max_tokens: int = int(os.environ.get("FLOWDEX_MAX_TOKENS", 6000))
     budget: Budget = Field(default_factory=Budget)
+
+
+class RetryRequest(BaseModel):
+    """Payload used to retry a previous inference run."""
+
+    error_context: str = Field(
+        ...,
+        description="The error message or log output from the failed attempt.",
+    )
+    system_prompt_override: Optional[str] = None
+    user_input_override: Optional[str] = None
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> bool:
+    """Validate the provided API key if one is configured."""
+
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return True
 
 
 def _hash(s: str) -> str:
@@ -254,7 +292,7 @@ def call_llm(prompt: Dict[str, Any], request: InferRequest, tool_specs: List[Dic
 
 
 @app.post("/memory/put")
-def memory_put(item: Dict[str, Any]):
+def memory_put(item: Dict[str, Any], authorized: bool = Depends(require_api_key)):
     id_ = item.get("id")
     if not id_:
         raise HTTPException(400, "id is required")
@@ -275,7 +313,7 @@ def memory_put(item: Dict[str, Any]):
 
 
 @app.get("/memory/get")
-def memory_get(id: str, version: Optional[int] = None):
+def memory_get(id: str, version: Optional[int] = None, authorized: bool = Depends(require_api_key)):
     client = get_redis()
     key = f"{MEMORY_KEY_PREFIX}{id}"
     try:
@@ -304,7 +342,7 @@ def memory_get(id: str, version: Optional[int] = None):
 
 
 @app.post("/tools/register")
-def register_tool(spec: Dict[str, Any]):
+def register_tool(spec: Dict[str, Any], authorized: bool = Depends(require_api_key)):
     name = spec.get("name")
     if not name:
         raise HTTPException(400, "tool name required")
@@ -318,7 +356,7 @@ def register_tool(spec: Dict[str, Any]):
 
 
 @app.get("/runs/{run_id}")
-def get_run(run_id: str):
+def get_run(run_id: str, authorized: bool = Depends(require_api_key)):
     client = get_redis()
     try:
         payload = client.hget(RUNS_KEY, run_id)
@@ -332,8 +370,7 @@ def get_run(run_id: str):
         raise HTTPException(500, detail="Stored run data is corrupted")
 
 
-@app.post("/infer")
-def infer(req: InferRequest):
+def run_inference(req: InferRequest) -> Dict[str, Any]:
     client = get_redis()
     context_blob = ""
     for cid in req.context_ids:
@@ -405,3 +442,53 @@ def infer(req: InferRequest):
         "retrievals": retrieved_contexts,
         "tools_considered": tool_names,
     }
+
+
+@app.post("/infer")
+def infer(req: InferRequest, authorized: bool = Depends(require_api_key)):
+    return run_inference(req)
+
+
+@app.post("/infer/{run_id}/retry")
+def infer_retry(
+    run_id: str,
+    retry_req: RetryRequest,
+    authorized: bool = Depends(require_api_key),
+):
+    client = get_redis()
+
+    try:
+        payload = client.hget(RUNS_KEY, run_id)
+    except RedisError as exc:
+        raise HTTPException(500, detail=f"Failed to load original run: {exc}") from exc
+
+    if not payload:
+        raise HTTPException(404, detail="Original run not found")
+
+    try:
+        original_manifest = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(500, detail="Original run data is corrupted") from exc
+
+    original_req_dict = original_manifest.get("request") or {}
+
+    try:
+        original_req = InferRequest(**original_req_dict)
+    except Exception as exc:
+        raise HTTPException(400, detail=f"Failed to parse original request: {exc}") from exc
+
+    new_system_prompt = retry_req.system_prompt_override or original_req.system_prompt
+    new_user_input = retry_req.user_input_override or original_req.user_input
+
+    error_prefix = (
+        "--- Previous Attempt Failed ---\n"
+        "The previous attempt to solve this task failed with the following error:\n"
+        f"<error>\n{retry_req.error_context}\n</error>\n"
+        "Please analyze this error and provide a new solution.\n"
+        "--- Original System Prompt ---\n"
+    )
+
+    original_req.system_prompt = error_prefix + new_system_prompt
+    original_req.user_input = new_user_input
+
+    return run_inference(original_req)
