@@ -90,12 +90,12 @@ async def handle_mcp_request(request: Request) -> Dict[str, Any]:
     try:
         if method == "ping":
             return mcp_respond(request_id, result={"ok": True, "ts": time.time()})
-        if method == "flowdex.infer":
+        elif method == "flowdex.infer":
             return mcp_respond(
                 request_id,
                 result=call_api("POST", "/infer", json_body=params),
             )
-        if method == "flowdex.infer.retry":
+        elif method == "flowdex.infer.retry":
             run_id = params.get("run_id")
             if not run_id:
                 raise BridgeError("run_id is required for flowdex.infer.retry")
@@ -112,17 +112,18 @@ async def handle_mcp_request(request: Request) -> Dict[str, Any]:
                     json_body=retry_payload,
                 ),
             )
-        if method == "flowdex.memory.get":
+        elif method == "flowdex.memory.get":
             return mcp_respond(
                 request_id,
                 result=call_api("GET", "/memory/get", params=params),
             )
-        if method == "flowdex.health":
+        elif method == "flowdex.health":
             return mcp_respond(
                 request_id,
                 result=call_api("GET", "/health", params=params),
             )
-        raise BridgeError(f"Unknown method: {method}")
+        else:
+            raise BridgeError(f"Unknown method: {method}")
     except BridgeError as exc:
         return mcp_respond(request_id, error=str(exc))
     except Exception as exc:  # pragma: no cover - defensive programming
