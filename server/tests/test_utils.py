@@ -10,8 +10,9 @@ from server.app import (
     _safe_json_dumps,
     _tokenize,
     build_tool_context,
+    count_tokens,
     json_patch,
-    truncate_to_budget,
+    truncate_to_token_budget,
 )
 
 
@@ -27,9 +28,19 @@ def test_json_patch(old: str, new: str, expected: dict[str, object]) -> None:
     assert json_patch(old, new) == expected
 
 
-def test_truncate_to_budget() -> None:
-    assert truncate_to_budget("abcdef", 10) == "abcdef"
-    assert truncate_to_budget("abcdef", 3) == "def"
+def test_truncate_to_token_budget() -> None:
+    text = "abcdef" * 5
+    truncated, tokens = truncate_to_token_budget(text, 3)
+    assert truncated.endswith("def")
+    assert tokens <= 3
+
+    truncated_full, tokens_full = truncate_to_token_budget(text, 100)
+    assert truncated_full == text
+    assert tokens_full >= count_tokens(text)
+
+    empty_text, empty_tokens = truncate_to_token_budget("", 10)
+    assert empty_text == ""
+    assert empty_tokens == 0
 
 
 @pytest.mark.parametrize(
@@ -51,7 +62,7 @@ def test_build_tool_context_truncates_and_serializes() -> None:
         {"name": "beta", "description": "second", "cost": "low", "schema": complex_schema},
     ]
 
-    context = build_tool_context(tool_specs, budget_chars=500)
+    context = build_tool_context(tool_specs, max_length=500)
     assert "Tool: alpha" in context
     assert "Schema: {\"x\": \"int\"}" in context
     # Non-serializable value should fallback to repr
