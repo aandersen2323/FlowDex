@@ -25,6 +25,7 @@ MEMORY_INDEX_KEY = "flowdex:memory:index"
 TOOLS_KEY = "flowdex:tools"
 RUNS_KEY = "flowdex:runs"
 API_KEY = os.environ.get("FLOWDEX_API_KEY")
+ANTHROPIC_TIMEOUT = int(os.environ.get("FLOWDEX_ANTHROPIC_TIMEOUT", 60))
 
 
 def get_redis() -> redis.Redis:
@@ -135,6 +136,17 @@ def truncate_to_budget(text: str, budget_chars: int) -> str:
     return text[-budget_chars:]
 
 
+def _safe_json_dumps(value: Any) -> str:
+    """Serialize a value to JSON, falling back to ``repr`` when necessary."""
+
+    try:
+        return json.dumps(value, sort_keys=True)
+    except TypeError:
+        # ``repr`` keeps debugging information without raising an exception that would
+        # otherwise abort the inference run when a tool registers a complex schema.
+        return repr(value)
+
+
 def build_tool_context(tool_specs: List[Dict[str, Any]], budget_chars: int) -> str:
     if not tool_specs:
         return ""
@@ -145,7 +157,14 @@ def build_tool_context(tool_specs: List[Dict[str, Any]], budget_chars: int) -> s
         cost = spec.get("cost", "")
         schema = spec.get("schema", {})
         serialized.append(
-            f"Tool: {name}\nDescription: {description}\nCost: {cost}\nSchema: {json.dumps(schema)}"
+            "\n".join(
+                (
+                    f"Tool: {name}",
+                    f"Description: {description}",
+                    f"Cost: {cost}",
+                    f"Schema: {_safe_json_dumps(schema)}",
+                )
+            )
         )
     blob = "\n\n".join(serialized)
     return truncate_to_budget(blob, budget_chars)
@@ -272,12 +291,17 @@ def call_llm(prompt: Dict[str, Any], request: InferRequest, tool_specs: List[Dic
     }
 
     try:
-        response = requests.post(base_url, headers=headers, json=payload, timeout=60)
+        response = requests.post(
+            base_url, headers=headers, json=payload, timeout=ANTHROPIC_TIMEOUT
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         raise HTTPException(502, detail=f"Anthropic API request failed: {exc}") from exc
 
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(502, detail=f"Anthropic API response was not valid JSON: {exc}") from exc
     content = data.get("content", [])
     text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
     completion = "\n".join(part for part in text_parts if part)
