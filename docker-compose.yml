@@ -13,10 +13,22 @@ services:
       - FLOWDEX_BUDGET_CONTEXT=${FLOWDEX_BUDGET_CONTEXT:-2500}
       - FLOWDEX_BUDGET_USER=${FLOWDEX_BUDGET_USER:-1500}
       - FLOWDEX_BUDGET_TOOLS=${FLOWDEX_BUDGET_TOOLS:-1000}
+      - FLOWDEX_REDIS_HOST=redis
+      - FLOWDEX_API_KEY=${FLOWDEX_API_KEY:-}
     volumes:
       - ./_data:/data
     depends_on:
       - redis
+  mcp_bridge:
+    build: ./mcp
+    ports:
+      - "${FLOWDEX_MCP_PORT:-8788}:8788"
+    environment:
+      - FLOWDEX_API_URL=http://api:8787
+      - FLOWDEX_MCP_PORT=8788
+      - FLOWDEX_API_KEY=${FLOWDEX_API_KEY:-}
+    depends_on:
+      - api
   redis:
     image: redis:7-alpine
     ports:
