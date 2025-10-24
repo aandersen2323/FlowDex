@@ -276,6 +276,10 @@ The `examples/` folder contains end-to-end scenarios you can run as templates:
 
 Each example is annotated with the commands needed to reproduce the run, making it easy to adapt to your own workflows.
 
+## Contributing
+
+Interested in improving FlowDex? Read the [contribution guide](CONTRIBUTING.md) for setup instructions and the recommended debugging workflow (automated tests ➝ Playwright verification ➝ manual checks only when unavoidable). The guide also includes a pull-request checklist to keep changes ship-ready.
+
 ---
 
 © 2025 FlowDex. Generated 2025-10-23T00:31:05.007257Z
