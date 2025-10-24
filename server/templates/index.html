@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card-grid">
+  <div class="card">
+    <h2>Explore Runs</h2>
+    <p class="muted">Search and inspect inference manifests, tags, and metadata.</p>
+    <a class="button" href="/ui/runs">Open Runs &rarr;</a>
+  </div>
+  <div class="card">
+    <h2>Memory Browser</h2>
+    <p class="muted">Review stored knowledge snippets that power retrieval-augmented prompts.</p>
+    <a class="button" href="/ui/memory">View Memory &rarr;</a>
+  </div>
+  <div class="card">
+    <h2>Manual Inference</h2>
+    <p class="muted">Submit on-demand /infer requests or trigger autonomous auto-fix loops.</p>
+    <div class="stack">
+      <a class="button" href="/ui/infer">Manual Infer &rarr;</a>
+      <a class="button" href="/ui/auto-fix">Launch Auto-Fix &rarr;</a>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Usage Insights</h2>
+    <p class="muted">Track token consumption per API key or usage identifier.</p>
+    <a class="button" href="/ui/usage">Usage Dashboard &rarr;</a>
+  </div>
+</div>
+{% endblock %}

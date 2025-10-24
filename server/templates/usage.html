@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Usage Explorer</h2>
+<p class="muted">Query token consumption metrics for any usage identifier or API key.</p>
+<form class="stack" data-endpoint="" onsubmit="return false;">
+  <label>
+    API Key (optional)
+    <input type="text" name="api_key" placeholder="sk-..." />
+  </label>
+  <label>
+    Usage Identity
+    <input type="text" name="identity" placeholder="customer-team" />
+  </label>
+  <div class="stack" style="flex-direction: row; gap: 0.5rem; align-items: center;">
+    <button type="button" onclick="fetchUsage(this.closest('form'))">Fetch Usage</button>
+  </div>
+  <div class="output" data-output></div>
+</form>
+<script>
+  async function fetchUsage(form) {
+    const identity = form.querySelector("input[name='identity']").value.trim();
+    const apiKey = form.querySelector("input[name='api_key']").value.trim();
+    const output = form.querySelector("[data-output]");
+    if (!identity) {
+      output.textContent = "Provide an identity to fetch usage.";
+      return;
+    }
+    const headers = {};
+    if (apiKey) {
+      headers["X-API-Key"] = apiKey;
+    }
+    output.textContent = "Loading...";
+    try {
+      const response = await fetch(`/usage/${encodeURIComponent(identity)}`, { headers });
+      const text = await response.text();
+      try {
+        output.textContent = JSON.stringify(JSON.parse(text), null, 2);
+      } catch (err) {
+        output.textContent = text || `HTTP ${response.status}`;
+      }
+    } catch (err) {
+      output.textContent = `Request failed: ${err}`;
+    }
+  }
+</script>
+{% endblock %}

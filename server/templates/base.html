@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>FlowDex Control Panel</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0f172a;
+        --bg-light: #1e293b;
+        --fg: #e2e8f0;
+        --accent: #38bdf8;
+        --muted: #94a3b8;
+        font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 1.5rem 2rem;
+        background: linear-gradient(120deg, rgba(56, 189, 248, 0.15), transparent);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+      }
+      header h1 {
+        margin: 0;
+        font-size: 1.6rem;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+      nav {
+        margin-top: 0.75rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+      }
+      nav a {
+        color: var(--fg);
+        text-decoration: none;
+        padding: 0.35rem 0.75rem;
+        border-radius: 9999px;
+        background: rgba(148, 163, 184, 0.15);
+        transition: background 0.2s ease, transform 0.2s ease;
+      }
+      nav a:hover {
+        background: rgba(56, 189, 248, 0.25);
+        transform: translateY(-1px);
+      }
+      main {
+        flex: 1;
+        padding: 2rem;
+        max-width: 1100px;
+        width: 100%;
+        margin: 0 auto;
+      }
+      footer {
+        font-size: 0.85rem;
+        padding: 1rem 2rem;
+        color: var(--muted);
+        border-top: 1px solid rgba(148, 163, 184, 0.2);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: rgba(15, 23, 42, 0.6);
+        border-radius: 0.75rem;
+        overflow: hidden;
+      }
+      th, td {
+        padding: 0.75rem 1rem;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+        text-align: left;
+      }
+      th {
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      tr:hover td {
+        background: rgba(56, 189, 248, 0.08);
+      }
+      .card-grid {
+        display: grid;
+        gap: 1.5rem;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      }
+      .card {
+        padding: 1.5rem;
+        border-radius: 1rem;
+        background: rgba(15, 23, 42, 0.7);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        box-shadow: 0 10px 35px rgba(8, 47, 73, 0.25);
+      }
+      .card h2 {
+        margin-top: 0;
+        font-size: 1.1rem;
+      }
+      .card p {
+        margin-bottom: 0.75rem;
+        color: var(--muted);
+      }
+      a.button {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.4rem 0.9rem;
+        background: rgba(56, 189, 248, 0.15);
+        color: var(--fg);
+        border-radius: 999px;
+        text-decoration: none;
+        transition: background 0.2s ease, transform 0.2s ease;
+      }
+      a.button:hover {
+        background: rgba(56, 189, 248, 0.25);
+        transform: translateY(-1px);
+      }
+      pre {
+        background: rgba(15, 23, 42, 0.7);
+        padding: 1rem;
+        border-radius: 0.75rem;
+        overflow-x: auto;
+      }
+      form {
+        display: grid;
+        gap: 0.75rem;
+        background: rgba(15, 23, 42, 0.65);
+        padding: 1.5rem;
+        border-radius: 1rem;
+        border: 1px solid rgba(148, 163, 184, 0.18);
+      }
+      textarea, input, select {
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        border-radius: 0.5rem;
+        padding: 0.75rem;
+        color: var(--fg);
+        font-family: inherit;
+        font-size: 0.95rem;
+      }
+      button {
+        background: var(--accent);
+        color: #0f172a;
+        border: none;
+        padding: 0.75rem 1.25rem;
+        border-radius: 0.75rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+      button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 10px 25px rgba(56, 189, 248, 0.35);
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.15rem 0.6rem;
+        margin-right: 0.35rem;
+        margin-bottom: 0.35rem;
+        border-radius: 9999px;
+        background: rgba(56, 189, 248, 0.1);
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .stack {
+        display: grid;
+        gap: 1rem;
+      }
+      .output {
+        background: rgba(15, 23, 42, 0.8);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 0.75rem;
+        padding: 1rem;
+        min-height: 120px;
+        white-space: pre-wrap;
+      }
+    </style>
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        document.querySelectorAll("form[data-endpoint]").forEach((form) => {
+          form.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            const endpoint = form.dataset.endpoint;
+            const method = form.dataset.method || "POST";
+            const output = form.querySelector("[data-output]");
+            const apiKey = form.querySelector("input[name='api_key']")?.value || "";
+            const payloadField = form.querySelector("textarea[name='payload']");
+            let body = payloadField ? payloadField.value.trim() : "{}";
+            if (!body) {
+              body = "{}";
+            }
+            try {
+              JSON.parse(body);
+            } catch (err) {
+              output.textContent = `Payload must be valid JSON: ${err}`;
+              return;
+            }
+            const headers = { "Content-Type": "application/json" };
+            if (apiKey) {
+              headers["X-API-Key"] = apiKey;
+            }
+            output.textContent = "Submitting request...";
+            try {
+              const response = await fetch(endpoint, {
+                method,
+                headers,
+                body,
+              });
+              const text = await response.text();
+              let parsed;
+              try {
+                parsed = JSON.parse(text);
+                output.textContent = JSON.stringify(parsed, null, 2);
+              } catch (err) {
+                output.textContent = text || `HTTP ${response.status}`;
+              }
+            } catch (err) {
+              output.textContent = `Request failed: ${err}`;
+            }
+          });
+        });
+      });
+    </script>
+  </head>
+  <body>
+    <header>
+      <h1>FlowDex Control Panel</h1>
+      <nav>
+        <a href="/ui">Overview</a>
+        <a href="/ui/runs">Runs</a>
+        <a href="/ui/memory">Memory</a>
+        <a href="/ui/infer">Manual Infer</a>
+        <a href="/ui/auto-fix">Auto-Fix</a>
+        <a href="/ui/usage">Usage</a>
+      </nav>
+    </header>
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+    <footer>
+      FlowDex &mdash; orchestrate with confidence.
+    </footer>
+  </body>
+</html>

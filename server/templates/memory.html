@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Memory Entries</h2>
+<p class="muted">Latest knowledge snippets stored in Redis. Click an entry to review full history.</p>
+<form method="get" class="stack">
+  <label>
+    Limit
+    <input type="number" name="limit" value="{{ limit }}" min="1" max="200" />
+  </label>
+  <button type="submit">Apply</button>
+</form>
+{% if entries %}
+<table>
+  <thead>
+    <tr>
+      <th>Memory ID</th>
+      <th>Preview</th>
+      <th>Last Updated</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for entry in entries %}
+    <tr>
+      <td><a href="/ui/memory/{{ entry.id }}">{{ entry.id }}</a></td>
+      <td>{{ entry.preview }}</td>
+      <td class="muted">{{ entry.ts }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No memory has been captured yet.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Memory {{ memory_id }}</h2>
+<p class="muted">Showing all stored revisions (most recent first).</p>
+<div class="stack">
+  {% for version in versions %}
+  <div class="card">
+    <h3>Version {{ version.version }}</h3>
+    <pre>{{ version.payload | tojson(indent=2) }}</pre>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -6,3 +6,4 @@ redis
 requests
 tiktoken
 pydantic-settings
+jinja2
