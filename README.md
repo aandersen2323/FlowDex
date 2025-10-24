@@ -10,6 +10,34 @@ Token‑efficient LLM router + context manager for **n8n** and **Claude Code (MC
 - **CLI**: Inspect budgets, cache, and reproduce runs.
 - **Local stack**: `docker-compose.yml` (API + Redis + MCP bridge). SQLite used for persistence by default. Swap in real vector DB later.
 
+## Why FlowDex Exists
+
+FlowDex grew out of shipping real automations where “just throw more tokens at the prompt” stopped scaling. Product teams and
+operators needed to preserve weeks of context, tool transcripts, and troubleshooting notes without paying for massive context
+windows or rewriting flows every time the prompt changed. FlowDex packages those lessons into a single, opinionated service that:
+
+- Preserves the **working memory** of an automation across turns without duplicating the full transcript.
+- Routes expensive LLM calls only when they add value, preferring cached results or cheaper tools.
+- Gives operators an auditable trail of what the assistant saw, which tool it picked, and why decisions were made.
+
+## What FlowDex Does
+
+At its core FlowDex is a FastAPI service that tracks every interaction in an LLM-powered workflow. It stores diffs between turns,
+enforces token budgets, records retries, and makes every run reproducible. The same backend also powers:
+
+- An MCP bridge so Claude Code (VS Code) can call the exact API used in production.
+- An n8n node that lets low-code builders orchestrate FlowDex without custom HTTP glue.
+- A CLI for inspecting cache hits, budgets, manifests, and reproducing runs locally.
+
+## How FlowDex Helps You
+
+By centralizing prompting logic and run history, FlowDex lets you:
+
+1. **Ship faster** – Build against one API whether the assistant runs in n8n, Claude Code, or bespoke scripts.
+2. **Spend less** – Delta-context, semantic recall, and strict budgets keep token usage predictable and low.
+3. **Operate confidently** – Persisted run manifests, diffed context, and replay tooling make debugging straightforward.
+4. **Stay flexible** – Swap models, retrieval engines, or tool definitions without rewriting every workflow node.
+
 ## Key Ideas
 
 1. **Delta Context (Patch Prompting)**: send only what changed. We compute a content hash and minimal JSON Patch between turns.
