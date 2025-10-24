@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -16,15 +17,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 try:
     import tiktoken
-    try:
-        _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
-        _HAS_TIKTOKEN = True
-    except Exception:  # pragma: no cover - optional dependency retrieval failure
-        _TOKEN_ENCODER = None
-        _HAS_TIKTOKEN = False
 except ImportError:  # pragma: no cover - optional dependency
+    tiktoken = None
     _TOKEN_ENCODER = None
     _HAS_TIKTOKEN = False
+else:
+    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    _HAS_TIKTOKEN = True
+
+
+logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -428,11 +430,36 @@ def call_llm(prompt: Dict[str, Any], request: InferRequest, tool_specs: List[Dic
         )
         response.raise_for_status()
     except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        response_excerpt: Optional[str]
+        if getattr(exc, "response", None) is not None:
+            try:
+                response_excerpt = exc.response.text[:500]
+            except Exception:  # pragma: no cover - defensive
+                response_excerpt = None
+        else:
+            response_excerpt = None
+        logger.error(
+            "Anthropic API request failed",
+            extra={
+                "url": base_url,
+                "status": status,
+                "payload_model": payload.get("model"),
+                "payload_max_tokens": payload.get("max_tokens"),
+                "response_excerpt": response_excerpt,
+            },
+            exc_info=True,
+        )
         raise HTTPException(502, detail=f"Anthropic API request failed: {exc}") from exc
 
     try:
         data = response.json()
     except ValueError as exc:
+        logger.error(
+            "Anthropic API response was not valid JSON",
+            extra={"url": base_url, "status": response.status_code},
+            exc_info=True,
+        )
         raise HTTPException(502, detail=f"Anthropic API response was not valid JSON: {exc}") from exc
     content = data.get("content", [])
     text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
@@ -534,15 +561,23 @@ def _extract_auto_fix_json(text: str) -> Dict[str, Any]:
     if not text:
         return {}
 
+    try:
+        return json.loads(text, strict=False)
+    except json.JSONDecodeError:
+        pass
+
     candidates: List[str] = []
 
     fence_match = _CODE_FENCE_RE.search(text)
     if fence_match:
-        candidates.append(fence_match.group(1).strip())
+        fence_payload = fence_match.group(1).strip()
+        if fence_payload:
+            candidates.append(fence_payload)
 
-    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace_match:
-        candidates.append(brace_match.group(0).strip())
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidates.append(text[first_brace : last_brace + 1].strip())
 
     candidates.append(text)
 
@@ -555,7 +590,9 @@ def _extract_auto_fix_json(text: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             continue
 
-    print(f"Warning: Could not parse JSON from auto-fix completion: {text[:100]}...")
+    logger.warning(
+        "Could not parse JSON from auto-fix completion", extra={"preview": text[:100]}
+    )
     return {}
 
 

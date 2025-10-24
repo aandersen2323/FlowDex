@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Any, Dict, Optional
@@ -18,6 +19,8 @@ BRIDGE_HOST = os.environ.get("FLOWDEX_MCP_HOST", "0.0.0.0")
 API_KEY = os.environ.get("FLOWDEX_API_KEY")
 
 app = FastAPI(title="FlowDex MCP Bridge", version="0.1.0")
+
+logger = logging.getLogger(__name__)
 
 
 class BridgeError(RuntimeError):
@@ -55,11 +58,21 @@ def call_api(
             )
         response.raise_for_status()
     except requests.RequestException as exc:  # pragma: no cover - network failure
+        logger.error(
+            "FlowDex API request failed",
+            extra={"url": url, "method": method.upper()},
+            exc_info=True,
+        )
         raise BridgeError(f"FlowDex API request failed: {exc}") from exc
 
     try:
         return response.json()
     except json.JSONDecodeError as exc:  # pragma: no cover - invalid response
+        logger.error(
+            "Invalid JSON response from FlowDex API",
+            extra={"url": url, "method": method.upper()},
+            exc_info=True,
+        )
         raise BridgeError(f"Invalid JSON response from FlowDex API: {exc}") from exc
 
 
@@ -130,8 +143,16 @@ async def handle_mcp_request(request: Request) -> Dict[str, Any]:
         else:
             raise BridgeError(f"Unknown method: {method}")
     except BridgeError as exc:
+        logger.error(
+            "Bridge error while handling MCP request",
+            extra={"method": method, "request_id": request_id},
+            exc_info=True,
+        )
         return mcp_respond(request_id, error=str(exc))
     except Exception as exc:  # pragma: no cover - defensive programming
+        logger.exception(
+            "Unhandled bridge error", extra={"method": method, "request_id": request_id}
+        )
         return mcp_respond(request_id, error=f"Unhandled bridge error: {exc}")
 
 
