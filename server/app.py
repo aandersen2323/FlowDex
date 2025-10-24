@@ -36,6 +36,21 @@ RUNS_KEY = "flowdex:runs"
 API_KEY = os.environ.get("FLOWDEX_API_KEY")
 ANTHROPIC_TIMEOUT = int(os.environ.get("FLOWDEX_ANTHROPIC_TIMEOUT", 60))
 
+AUTO_FIX_SYSTEM_PROMPT = """You are FlowDex AutoFix, an autonomous incident responder for automation workflows.\n" \
+    "You triage failing orchestrations by summarizing errors, identifying likely root causes, " \
+    "and prescribing concrete remediation steps that can be executed without human input.\n" \
+    "Always respond with a single JSON object containing the following keys:\n" \
+    "  - status: one of ['resolved', 'apply_fix', 'unrecoverable'].\n" \
+    "  - summary: short natural-language description of what happened.\n" \
+    "  - actions: array of actionable steps to remediate the failure.\n" \
+    "  - fix_instructions: detailed instructions or code patches to apply.\n" \
+    "  - metrics: object with optional numeric metadata such as confidence (0-1) and\n" \
+    "             estimated_minutes.\n" \
+    "If the provided information is insufficient, set status to 'unrecoverable' and explain\n" \
+    "what extra data is required. Keep responses concise but information-dense."""
+
+_VALID_AUTO_FIX_STATUSES = {"resolved", "apply_fix", "unrecoverable"}
+
 
 def get_redis() -> redis.Redis:
     global _REDIS_CLIENT
@@ -107,6 +122,42 @@ class RetryRequest(BaseModel):
     )
     system_prompt_override: Optional[str] = None
     user_input_override: Optional[str] = None
+
+
+class AutoFixRequest(BaseModel):
+    """Request payload for the automated troubleshooting workflow."""
+
+    error_log: str = Field(
+        ...,
+        min_length=1,
+        description="Raw error output from the failing workflow run.",
+    )
+    run_id: Optional[str] = Field(
+        default=None,
+        description="Optional run identifier to reuse a prior /infer invocation as the base request.",
+    )
+    request: Optional[InferRequest] = Field(
+        default=None,
+        description="Explicit request payload to use when no run_id is supplied.",
+    )
+    max_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Number of automated remediation attempts to perform.",
+    )
+    task_override: Optional[str] = Field(
+        default=None,
+        description="Optional replacement task description for the remediation attempts.",
+    )
+    system_prompt_override: Optional[str] = Field(
+        default=None,
+        description="Override the system prompt used during remediation analysis and fix runs.",
+    )
+    user_input_override: Optional[str] = Field(
+        default=None,
+        description="Override the user input used for fix attempts.",
+    )
 
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> bool:
@@ -448,6 +499,240 @@ def get_run(run_id: str, authorized: bool = Depends(require_api_key)):
         raise HTTPException(500, detail="Stored run data is corrupted")
 
 
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+
+def _extract_auto_fix_json(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
+    if not text:
+        return {}
+
+    candidates = []
+    match = _CODE_FENCE_RE.search(text)
+    if match:
+        candidates.append(match.group(1).strip())
+    candidates.append(text)
+
+    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace_match:
+        candidates.append(brace_match.group(0))
+
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def _parse_auto_fix_completion(text: str) -> Dict[str, Any]:
+    parsed = _extract_auto_fix_json(text)
+    if not parsed:
+        return {
+            "status": "unparsed",
+            "summary": (text or "").strip(),
+            "actions": [],
+            "fix_instructions": "",
+            "metrics": {},
+            "parsed": None,
+            "raw": text,
+        }
+
+    status = str(parsed.get("status", "")).lower().strip()
+    if status not in _VALID_AUTO_FIX_STATUSES:
+        status = "unparsed"
+
+    actions_raw = parsed.get("actions") or parsed.get("action_items") or []
+    if isinstance(actions_raw, str):
+        actions = [actions_raw.strip()]
+    else:
+        actions = [str(item) for item in actions_raw if item is not None]
+
+    fix_instructions = parsed.get("fix_instructions") or parsed.get("resolution") or ""
+    summary = parsed.get("summary") or parsed.get("analysis") or ""
+    metrics = parsed.get("metrics") or {}
+
+    return {
+        "status": status,
+        "summary": summary,
+        "actions": actions,
+        "fix_instructions": fix_instructions,
+        "metrics": metrics,
+        "parsed": parsed,
+        "raw": text,
+    }
+
+
+def _format_prior_auto_fix(prior: List[Dict[str, Any]]) -> str:
+    if not prior:
+        return "None. This is the first automated remediation attempt."
+
+    blocks: List[str] = []
+    for idx, item in enumerate(prior, start=1):
+        status = item.get("status", "unknown")
+        summary = item.get("summary", "")
+        structured = item.get("parsed") or {
+            "status": status,
+            "summary": summary,
+            "actions": item.get("actions", []),
+        }
+        blocks.append(
+            "\n".join(
+                (
+                    f"Attempt {idx} status: {status}",
+                    f"Summary: {summary}",
+                    "Structured response:",
+                    json.dumps(structured, indent=2, sort_keys=True),
+                )
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def _format_actions(actions: List[str]) -> str:
+    if not actions:
+        return "None provided."
+    return "\n".join(f"- {step}" for step in actions)
+
+
+def _resolve_auto_fix_base_request(auto_req: AutoFixRequest) -> InferRequest:
+    if auto_req.run_id:
+        client = get_redis()
+        try:
+            payload = client.hget(RUNS_KEY, auto_req.run_id)
+        except RedisError as exc:
+            raise HTTPException(500, detail=f"Failed to load original run: {exc}") from exc
+        if not payload:
+            raise HTTPException(404, detail="Original run not found")
+        try:
+            manifest = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(500, detail="Stored run data is corrupted") from exc
+        original_req_dict = manifest.get("request") or {}
+        try:
+            base_req = InferRequest(**original_req_dict)
+        except Exception as exc:
+            raise HTTPException(400, detail=f"Stored request is invalid: {exc}") from exc
+    elif auto_req.request is not None:
+        base_req = auto_req.request.copy(deep=True)
+    else:
+        raise HTTPException(
+            400,
+            detail="Either run_id or request must be supplied for automated remediation.",
+        )
+
+    base_req = base_req.copy(deep=True)
+
+    if auto_req.task_override is not None:
+        base_req.task = auto_req.task_override
+    if auto_req.system_prompt_override is not None:
+        base_req.system_prompt = auto_req.system_prompt_override
+    if auto_req.user_input_override is not None:
+        base_req.user_input = auto_req.user_input_override
+
+    return base_req
+
+
+def _build_auto_fix_analysis_request(
+    base_req: InferRequest,
+    auto_req: AutoFixRequest,
+    attempt: int,
+    prior: List[Dict[str, Any]],
+) -> InferRequest:
+    analysis_req = base_req.copy(deep=True)
+    analysis_req.task = f"Diagnose workflow failure for: {base_req.task}"
+    analysis_req.system_prompt = auto_req.system_prompt_override or AUTO_FIX_SYSTEM_PROMPT
+
+    history_blob = _format_prior_auto_fix(prior)
+    original_user_input = base_req.user_input or "(empty)"
+    user_sections = [
+        f"Automated remediation attempt {attempt} of {auto_req.max_attempts}.",
+        "Summarize the failure, determine root cause, and produce actionable remediation steps.",
+        "--- Latest Error Log ---",
+        auto_req.error_log,
+        "--- Original User Input ---",
+        original_user_input,
+        "--- Prior Analyses ---",
+        history_blob,
+    ]
+    analysis_req.user_input = "\n\n".join(section for section in user_sections if section)
+
+    return analysis_req
+
+
+def _build_auto_fix_fix_request(
+    base_req: InferRequest,
+    auto_req: AutoFixRequest,
+    analysis: Dict[str, Any],
+) -> InferRequest:
+    fix_req = base_req.copy(deep=True)
+    if auto_req.system_prompt_override:
+        fix_req.system_prompt = auto_req.system_prompt_override
+
+    base_input = fix_req.user_input or ""
+    actions_blob = _format_actions([str(step) for step in analysis.get("actions", [])])
+    plan_blob = _safe_json_dumps(analysis.get("parsed") or {})
+    remediation = analysis.get("fix_instructions") or analysis.get("summary") or ""
+
+    fix_req.user_input = "\n\n".join(
+        section
+        for section in (
+            base_input,
+            "<auto_fix_context>",
+            f"Latest error log:\n{auto_req.error_log}",
+            f"Analysis summary:\n{analysis.get('summary', '')}",
+            f"Action steps:\n{actions_blob}",
+            f"Remediation plan:\n{remediation}",
+            f"Structured response:\n{plan_blob}",
+            "</auto_fix_context>",
+            "Implement the remediation plan above and provide the corrected output.",
+        )
+        if section
+    )
+
+    return fix_req
+
+
+def run_auto_fix(auto_req: AutoFixRequest) -> Dict[str, Any]:
+    base_req = _resolve_auto_fix_base_request(auto_req)
+
+    attempts: List[Dict[str, Any]] = []
+    prior_analyses: List[Dict[str, Any]] = []
+
+    for attempt in range(1, auto_req.max_attempts + 1):
+        analysis_req = _build_auto_fix_analysis_request(base_req, auto_req, attempt, prior_analyses)
+        analysis_result = run_inference(analysis_req)
+        parsed_analysis = _parse_auto_fix_completion(analysis_result["output"].get("completion", ""))
+
+        attempt_record: Dict[str, Any] = {
+            "analysis_run": analysis_result,
+            "analysis": parsed_analysis,
+        }
+        attempts.append(attempt_record)
+        prior_analyses.append(parsed_analysis)
+
+        if parsed_analysis["status"] == "unrecoverable":
+            break
+
+        if not parsed_analysis.get("fix_instructions") and parsed_analysis["status"] == "unparsed":
+            break
+
+        fix_req = _build_auto_fix_fix_request(base_req, auto_req, parsed_analysis)
+        fix_result = run_inference(fix_req)
+        attempt_record["fix_run"] = fix_result
+
+        if parsed_analysis["status"] == "resolved":
+            break
+
+    return {
+        "base_request": base_req.dict(),
+        "attempts": attempts,
+    }
+
+
 def run_inference(req: InferRequest) -> Dict[str, Any]:
     client = get_redis()
     context_blob = ""
@@ -577,3 +862,8 @@ def infer_retry(
 
     print(f"Retrying run {run_id}. Added error context to user input.")
     return run_inference(original_req)
+
+
+@app.post("/infer/auto-fix")
+def infer_auto_fix(auto_req: AutoFixRequest, authorized: bool = Depends(require_api_key)):
+    return run_auto_fix(auto_req)
