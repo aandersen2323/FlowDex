@@ -117,6 +117,11 @@ async def handle_mcp_request(request: Request) -> Dict[str, Any]:
                 request_id,
                 result=call_api("GET", "/memory/get", params=params),
             )
+        elif method == "flowdex.infer.auto_fix":
+            return mcp_respond(
+                request_id,
+                result=call_api("POST", "/infer/auto-fix", json_body=params),
+            )
         elif method == "flowdex.health":
             return mcp_respond(
                 request_id,
