@@ -55,14 +55,14 @@ def test_tokenize(text: str, expected: list[str]) -> None:
     assert _tokenize(text) == expected
 
 
-def test_build_tool_context_truncates_and_serializes() -> None:
+def test_build_tool_context_serializes() -> None:
     complex_schema = {"callable": math.sqrt}
     tool_specs = [
         {"name": "alpha", "description": "first", "cost": 10, "schema": {"x": "int"}},
         {"name": "beta", "description": "second", "cost": "low", "schema": complex_schema},
     ]
 
-    context = build_tool_context(tool_specs, max_length=500)
+    context = build_tool_context(tool_specs)
     assert "Tool: alpha" in context
     assert "Schema: {\"x\": \"int\"}" in context
     # Non-serializable value should fallback to repr
