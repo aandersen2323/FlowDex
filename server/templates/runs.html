@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Recent Runs</h2>
+<form method="get" class="stack">
+  <label>
+    Filter by tag
+    <input type="text" name="tag" value="{{ tag or '' }}" placeholder="production" />
+  </label>
+  <label>
+    Limit
+    <input type="number" name="limit" value="{{ limit }}" min="1" max="200" />
+  </label>
+  <button type="submit">Apply Filters</button>
+</form>
+
+{% if runs %}
+<table>
+  <thead>
+    <tr>
+      <th>Run ID</th>
+      <th>Task</th>
+      <th>Tags</th>
+      <th>Model</th>
+      <th>Timestamp</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for run in runs %}
+    <tr>
+      <td><a href="/ui/runs/{{ run.run_id }}">{{ run.run_id }}</a></td>
+      <td>{{ run.task or '—' }}</td>
+      <td>
+        {% for tag in run.tags %}
+        <span class="tag">{{ tag }}</span>
+        {% endfor %}
+      </td>
+      <td>{{ run.model or 'default' }}</td>
+      <td class="muted">{{ run.ts }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No runs found. Submit an /infer request to generate history.</p>
+{% endif %}
+{% endblock %}

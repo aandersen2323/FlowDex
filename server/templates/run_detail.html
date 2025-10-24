@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Run {{ run_id }}</h2>
+<p class="muted">Inspect the stored manifest for this inference request.</p>
+<pre>{{ manifest_json }}</pre>
+{% endblock %}

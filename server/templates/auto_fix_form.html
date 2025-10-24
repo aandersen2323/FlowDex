@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Launch Auto-Fix</h2>
+<p class="muted">Kick off the autonomous remediation loop with a captured error log.</p>
+<form data-endpoint="/infer/auto-fix" data-method="POST">
+  <label>
+    API Key (optional)
+    <input type="text" name="api_key" placeholder="sk-..." />
+  </label>
+  <label>
+    Auto-Fix Payload (JSON)
+    <textarea name="payload" rows="14">{{ sample_payload }}</textarea>
+  </label>
+  <button type="submit">Start Auto-Fix</button>
+  <div class="output" data-output></div>
+</form>
+{% endblock %}

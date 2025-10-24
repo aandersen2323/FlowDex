@@ -1,29 +1,32 @@
 import hashlib
 import json
 import logging
-import math
 import re
 import time
-from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import redis
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-try:
-    import tiktoken
-except ImportError:  # pragma: no cover - optional dependency
-    tiktoken = None
-    _TOKEN_ENCODER = None
-    _HAS_TIKTOKEN = False
-else:
-    _TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
-    _HAS_TIKTOKEN = True
+try:  # pragma: no cover - optional dependency
+    import jinja2  # type: ignore
+except ImportError:  # pragma: no cover - degrade gracefully when templates unavailable
+    jinja2 = None  # type: ignore
+
+from .components import (
+    BaseSemanticRecall,
+    BaseTokenizer,
+    DefaultTokenizer,
+    RedisTFIDFSemanticRecall,
+    instantiate_component,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +50,8 @@ class Settings(BaseSettings):
     flowdex_redis_host: str = "localhost"
     flowdex_redis_port: int = 6379
     flowdex_redis_db: int = 0
+    flowdex_tokenizer_impl: Optional[str] = None
+    flowdex_semantic_recall_impl: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     flowdex_anthropic_url: str = "https://api.anthropic.com/v1/messages"
     flowdex_anthropic_version: str = "2023-06-01"
@@ -58,29 +63,48 @@ CACHE_DIR = settings.flowdex_cache_dir
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="FlowDex API", version="0.1.0")
+if jinja2 is not None:
+    templates: Optional[Jinja2Templates] = Jinja2Templates(
+        directory=str((Path(__file__).parent / "templates").resolve())
+    )
+else:  # pragma: no cover - executed only when optional dependency missing
+    templates = None
 
 _REDIS_CLIENT: Optional[redis.Redis] = None
+TOKENIZER: BaseTokenizer = instantiate_component(
+    settings.flowdex_tokenizer_impl, DefaultTokenizer
+)
+_SEMANTIC_ENGINE: Optional[BaseSemanticRecall] = None
+
 MEMORY_KEY_PREFIX = "flowdex:memory:"
 MEMORY_INDEX_KEY = "flowdex:memory:index"
 TOOLS_KEY = "flowdex:tools"
 RUNS_KEY = "flowdex:runs"
+RUN_TAGS_KEY = "flowdex:run_tags"
+RUN_TAG_INDEX_PREFIX = "flowdex:run_tag:"
+RUN_METADATA_KEY = "flowdex:run_meta"
+USAGE_KEY_PREFIX = "flowdex:usage:"
 API_KEY = settings.flowdex_api_key
 ANTHROPIC_TIMEOUT = settings.flowdex_anthropic_timeout
 
 AUTO_FIX_SYSTEM_PROMPT = """You are FlowDex AutoFix, an autonomous incident responder for automation workflows.\n" \
     "You triage failing orchestrations by summarizing errors, identifying likely root causes, " \
-    "and prescribing concrete remediation steps that can be executed without human input.\n" \
+    "and prescribing concrete remediation steps that can be executed without human input when possible.\n" \
     "Always respond with a single JSON object containing the following keys:\n" \
-    "  - status: one of ['resolved', 'apply_fix', 'unrecoverable'].\n" \
+    "  - status: one of ['resolved', 'apply_fix', 'unrecoverable', 'needs_human_review'].\n" \
     "  - summary: short natural-language description of what happened.\n" \
     "  - actions: array of actionable steps to remediate the failure.\n" \
+    "            When recommending automation tools, include objects such as\n" \
+    "            {\"type\": \"tool\", \"tool\": \"<registered_tool_name>\", \"input\": {...}}.\n" \
     "  - fix_instructions: detailed instructions or code patches to apply.\n" \
     "  - metrics: object with optional numeric metadata such as confidence (0-1) and\n" \
     "             estimated_minutes.\n" \
-    "If the provided information is insufficient, set status to 'unrecoverable' and explain\n" \
+    "If additional context or manual approval is required, return status 'needs_human_review' and describe\n" \
+    "what is needed. If information is insufficient, set status to 'unrecoverable' and explain\n" \
     "what extra data is required. Keep responses concise but information-dense."""
 
-_VALID_AUTO_FIX_STATUSES = {"resolved", "apply_fix", "unrecoverable"}
+_VALID_AUTO_FIX_STATUSES = {"resolved", "apply_fix", "unrecoverable", "needs_human_review"}
+DEFAULT_TOOL_TIMEOUT = 30
 
 
 def get_redis() -> redis.Redis:
@@ -105,6 +129,26 @@ def get_redis() -> redis.Redis:
 
     _REDIS_CLIENT = client
     return client
+
+
+def get_semantic_engine() -> BaseSemanticRecall:
+    global _SEMANTIC_ENGINE
+    if _SEMANTIC_ENGINE is not None:
+        return _SEMANTIC_ENGINE
+
+    try:
+        _SEMANTIC_ENGINE = instantiate_component(
+            settings.flowdex_semantic_recall_impl,
+            RedisTFIDFSemanticRecall,
+            redis_getter=get_redis,
+            tokenizer=TOKENIZER,
+            memory_index_key=MEMORY_INDEX_KEY,
+            memory_key_prefix=MEMORY_KEY_PREFIX,
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.error("Failed to initialize semantic recall engine", exc_info=True)
+        raise HTTPException(500, detail=f"Unable to initialize semantic recall engine: {exc}") from exc
+    return _SEMANTIC_ENGINE
 
 
 @app.get("/health")
@@ -142,6 +186,10 @@ class InferRequest(BaseModel):
     model: str = settings.flowdex_model
     max_tokens: int = settings.flowdex_max_tokens
     budget: Budget = Field(default_factory=Budget)
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    stream: bool = False
+    usage_identifier: Optional[str] = None
 
 
 class RetryRequest(BaseModel):
@@ -189,14 +237,18 @@ class AutoFixRequest(BaseModel):
         default=None,
         description="Override the user input used for fix attempts.",
     )
+    usage_identifier: Optional[str] = Field(
+        default=None,
+        description="Optional usage identity for tracking token consumption.",
+    )
 
 
-def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> bool:
-    """Validate the provided API key if one is configured."""
+def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> str:
+    """Validate the provided API key if one is configured and return the identifier used."""
 
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    return True
+    return x_api_key or "anonymous"
 
 
 def _hash(s: str) -> str:
@@ -206,11 +258,17 @@ def _hash(s: str) -> str:
 def save_run(manifest: Dict[str, Any]) -> str:
     run_id = _hash(str(time.time()) + json.dumps(manifest, sort_keys=True))
     client = get_redis()
+    tags = _normalize_tags(manifest.get("tags", []))
+    metadata = manifest.get("metadata") or {}
     try:
-        client.hset(RUNS_KEY, run_id, json.dumps(manifest))
+        client.hset(RUNS_KEY, run_id, json.dumps(manifest, default=str))
+        client.hset(RUN_TAGS_KEY, run_id, json.dumps(tags, default=str))
+        client.hset(RUN_METADATA_KEY, run_id, json.dumps(metadata, default=str))
+        for tag in tags:
+            client.sadd(f"{RUN_TAG_INDEX_PREFIX}{tag}", run_id)
     except RedisError as exc:
         raise HTTPException(500, detail=f"Failed to persist run: {exc}") from exc
-    (CACHE_DIR / f"run_{run_id}.json").write_text(json.dumps(manifest, indent=2))
+    (CACHE_DIR / f"run_{run_id}.json").write_text(json.dumps(manifest, indent=2, default=str))
     return run_id
 
 
@@ -221,48 +279,73 @@ def json_patch(old: str, new: str) -> Dict[str, Any]:
     return {"common_prefix": prefix_len, "added": new[prefix_len:]}
 
 
-def count_tokens(text: str) -> int:
-    """Count tokens using ``tiktoken`` when available, otherwise estimate."""
+def _normalize_tags(tags: Iterable[str]) -> List[str]:
+    seen = set()
+    normalized: List[str] = []
+    for tag in tags or []:
+        if not isinstance(tag, str):
+            continue
+        cleaned = tag.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(cleaned)
+    return normalized
 
-    if not text:
-        return 0
-    if _HAS_TIKTOKEN and _TOKEN_ENCODER is not None:
-        return len(_TOKEN_ENCODER.encode(text))
-    return max(1, len(text) // 4)
+
+def _record_usage(
+    identity: Optional[str], tokens_used: Dict[str, int], output: Dict[str, Any], run_id: str
+) -> None:
+    if not identity:
+        identity = "anonymous"
+
+    try:
+        prompt_tokens = int(sum(int(v) for v in tokens_used.values()))
+    except Exception:  # pragma: no cover - defensive conversion
+        prompt_tokens = 0
+
+    usage_data = output.get("usage") if isinstance(output, dict) else {}
+    completion_tokens = 0
+    if isinstance(usage_data, dict):
+        for key in ("output_tokens", "completion_tokens", "completion"):
+            value = usage_data.get(key)
+            if value is not None:
+                try:
+                    completion_tokens = int(value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+    if completion_tokens <= 0:
+        completion_tokens = count_tokens(output.get("completion", ""))
+
+    key = f"{USAGE_KEY_PREFIX}{identity}"
+    client = get_redis()
+    if not hasattr(client, "hincrby"):
+        return
+    try:
+        client.hincrby(key, "requests", 1)
+        client.hincrby(key, "prompt_tokens", max(prompt_tokens, 0))
+        client.hincrby(key, "completion_tokens", max(completion_tokens, 0))
+        client.hset(key, mapping={"last_run_id": run_id, "updated_at": str(time.time())})
+    except RedisError as exc:  # pragma: no cover - non-critical tracking failure
+        logger.warning(
+            "Failed to record usage statistics", extra={"identity": identity, "run_id": run_id}
+        )
+
+
+def count_tokens(text: str) -> int:
+    """Delegate token counting to the configured tokenizer."""
+
+    return TOKENIZER.count_tokens(text)
 
 
 def truncate_to_token_budget(text: str, budget_tokens: int) -> Tuple[str, int]:
-    """Truncate ``text`` to fit the supplied token budget.
+    """Truncate ``text`` to fit the supplied token budget using the configured tokenizer."""
 
-    Returns a tuple of the truncated text and the number of tokens consumed.
-    """
-
-    if not text or budget_tokens <= 0:
-        return "", 0
-
-    if not (_HAS_TIKTOKEN and _TOKEN_ENCODER is not None):
-        char_budget = max(budget_tokens * 4, 0)
-        truncated_text = text[-char_budget:] if char_budget else ""
-        return truncated_text, count_tokens(truncated_text)
-
-    tokens = _TOKEN_ENCODER.encode(text)
-    if len(tokens) <= budget_tokens:
-        return text, len(tokens)
-
-    truncated_tokens = tokens[-budget_tokens:]
-    try:
-        truncated_text = _TOKEN_ENCODER.decode(truncated_tokens)
-    except Exception:  # pragma: no cover - defensive decoding fallback
-        start_char = max(
-            0,
-            len(text)
-            - int(len(text) * (budget_tokens / max(len(tokens), 1)) * 1.1),
-        )
-        truncated_text = text[start_char:]
-        truncated_tokens = _TOKEN_ENCODER.encode(truncated_text)[-budget_tokens:]
-        truncated_text = _TOKEN_ENCODER.decode(truncated_tokens)
-
-    return truncated_text, len(truncated_tokens)
+    return TOKENIZER.truncate(text, budget_tokens)
 
 
 def _safe_json_dumps(value: Any) -> str:
@@ -299,11 +382,8 @@ def build_tool_context(tool_specs: List[Dict[str, Any]]) -> str:
     return blob
 
 
-TOKEN_PATTERN = re.compile(r"\b\w+\b", re.UNICODE)
-
-
 def _tokenize(text: str) -> List[str]:
-    return [tok for tok in TOKEN_PATTERN.findall(text.lower()) if tok]
+    return list(TOKENIZER.tokenize_semantic(text))
 
 
 def _latest_memory_version(client: redis.Redis, memory_id: str) -> Optional[Dict[str, Any]]:
@@ -322,48 +402,21 @@ def _latest_memory_version(client: redis.Redis, memory_id: str) -> Optional[Dict
 def semantic_recall(query: str, exclude_ids: List[str], limit: int = 3) -> List[Dict[str, Any]]:
     if not query or not query.strip():
         return []
-    tokens_query = _tokenize(query)
-    if not tokens_query:
-        return []
 
-    client = get_redis()
+    engine = get_semantic_engine()
     try:
-        memory_ids = client.smembers(MEMORY_INDEX_KEY)
-    except RedisError as exc:
-        raise HTTPException(500, detail=f"Failed to enumerate memory: {exc}") from exc
-
-    query_counter = Counter(tokens_query)
-    query_norm = math.sqrt(sum(v * v for v in query_counter.values())) or 1.0
-
-    scored: List[Dict[str, Any]] = []
-    for mem_id in memory_ids:
-        latest = _latest_memory_version(client, mem_id)
-        if not latest:
-            continue
-        doc_text = latest.get("data", "")
-        doc_tokens = _tokenize(doc_text)
-        if not doc_tokens:
-            continue
-        doc_counter = Counter(doc_tokens)
-        doc_norm = math.sqrt(sum(v * v for v in doc_counter.values())) or 1.0
-        dot = sum(query_counter[token] * doc_counter.get(token, 0) for token in query_counter)
-        score = dot / (query_norm * doc_norm)
-        if score <= 0:
-            continue
-        scored.append({"id": mem_id, "score": round(score, 6), "data": doc_text, "ts": latest.get("ts")})
-
-    scored.sort(key=lambda item: item["score"], reverse=True)
-    results: List[Dict[str, Any]] = []
-    for entry in scored:
-        if entry["id"] in exclude_ids:
-            continue
-        results.append(entry)
-        if len(results) >= limit:
-            break
-    return results
+        return engine.recall(query, exclude_ids, limit)
+    except RuntimeError as exc:
+        raise HTTPException(500, detail=str(exc)) from exc
 
 
-def call_llm(prompt: Dict[str, Any], request: InferRequest, tool_specs: List[Dict[str, Any]], retrieved: List[Dict[str, Any]]) -> Dict[str, Any]:
+def call_llm(
+    prompt: Dict[str, Any],
+    request: InferRequest,
+    tool_specs: List[Dict[str, Any]],
+    retrieved: List[Dict[str, Any]],
+    stream: bool = False,
+) -> Dict[str, Any]:
     api_key = settings.anthropic_api_key
     if not api_key:
         raise HTTPException(500, detail="ANTHROPIC_API_KEY environment variable is required for inference")
@@ -465,8 +518,11 @@ def call_llm(prompt: Dict[str, Any], request: InferRequest, tool_specs: List[Dic
     text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
     completion = "\n".join(part for part in text_parts if part)
 
+    completion_tokens = list(TOKENIZER.iter_tokens(completion))
+
     return {
         "completion": completion,
+        "completion_tokens": completion_tokens,
         "stop_reason": data.get("stop_reason"),
         "usage": data.get("usage", {}),
         "model": data.get("model", prompt["model"]),
@@ -475,7 +531,7 @@ def call_llm(prompt: Dict[str, Any], request: InferRequest, tool_specs: List[Dic
 
 
 @app.post("/memory/put")
-def memory_put(item: Dict[str, Any], authorized: bool = Depends(require_api_key)):
+def memory_put(item: Dict[str, Any], authorized: str = Depends(require_api_key)):
     id_ = item.get("id")
     if not id_:
         raise HTTPException(400, "id is required")
@@ -496,7 +552,7 @@ def memory_put(item: Dict[str, Any], authorized: bool = Depends(require_api_key)
 
 
 @app.get("/memory/get")
-def memory_get(id: str, version: Optional[int] = None, authorized: bool = Depends(require_api_key)):
+def memory_get(id: str, version: Optional[int] = None, authorized: str = Depends(require_api_key)):
     client = get_redis()
     key = f"{MEMORY_KEY_PREFIX}{id}"
     try:
@@ -524,8 +580,26 @@ def memory_get(id: str, version: Optional[int] = None, authorized: bool = Depend
         return {"ts": None, "data": payload}
 
 
+def _list_memory_entries(limit: int = 100) -> List[Dict[str, Any]]:
+    client = get_redis()
+    try:
+        memory_ids = sorted(client.smembers(MEMORY_INDEX_KEY))
+    except RedisError as exc:
+        raise HTTPException(500, detail=f"Failed to enumerate memory: {exc}") from exc
+
+    entries: List[Dict[str, Any]] = []
+    for memory_id in memory_ids[:limit]:
+        latest = _latest_memory_version(client, memory_id)
+        if not latest:
+            continue
+        data = latest.get("data", "")
+        preview = str(data)[:200]
+        entries.append({"id": memory_id, "ts": latest.get("ts"), "preview": preview})
+    return entries
+
+
 @app.post("/tools/register")
-def register_tool(spec: Dict[str, Any], authorized: bool = Depends(require_api_key)):
+def register_tool(spec: Dict[str, Any], authorized: str = Depends(require_api_key)):
     name = spec.get("name")
     if not name:
         raise HTTPException(400, "tool name required")
@@ -538,8 +612,52 @@ def register_tool(spec: Dict[str, Any], authorized: bool = Depends(require_api_k
     return {"ok": True, "count": count}
 
 
+def _list_runs(tag: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    client = get_redis()
+    try:
+        if tag:
+            normalized_tag = _normalize_tags([tag])
+            tag_key = normalized_tag[0] if normalized_tag else tag
+            run_ids = list(client.smembers(f"{RUN_TAG_INDEX_PREFIX}{tag_key}"))
+        else:
+            run_ids = client.hkeys(RUNS_KEY)
+    except RedisError as exc:
+        raise HTTPException(500, detail=f"Failed to enumerate runs: {exc}") from exc
+
+    runs: List[Dict[str, Any]] = []
+    for run_id in run_ids:
+        try:
+            payload = client.hget(RUNS_KEY, run_id)
+        except RedisError as exc:
+            raise HTTPException(500, detail=f"Failed to load run {run_id}: {exc}") from exc
+        if not payload:
+            continue
+        try:
+            manifest = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        request_payload = manifest.get("request") or {}
+        runs.append(
+            {
+                "run_id": run_id,
+                "task": request_payload.get("task"),
+                "tags": manifest.get("tags", []),
+                "metadata": manifest.get("metadata", {}),
+                "ts": manifest.get("ts"),
+                "model": request_payload.get("model"),
+            }
+        )
+
+    runs.sort(key=lambda item: item.get("ts") or 0, reverse=True)
+    if tag:
+        normalized_tag = _normalize_tags([tag])
+        tag_key = normalized_tag[0] if normalized_tag else tag
+        runs = [run for run in runs if tag_key in _normalize_tags(run.get("tags", []))]
+    return runs[:limit]
+
+
 @app.get("/runs/{run_id}")
-def get_run(run_id: str, authorized: bool = Depends(require_api_key)):
+def get_run(run_id: str, authorized: str = Depends(require_api_key)):
     client = get_redis()
     try:
         payload = client.hget(RUNS_KEY, run_id)
@@ -551,6 +669,38 @@ def get_run(run_id: str, authorized: bool = Depends(require_api_key)):
         return json.loads(payload)
     except json.JSONDecodeError:
         raise HTTPException(500, detail="Stored run data is corrupted")
+
+
+@app.get("/usage/{identity}")
+def get_usage(identity: str, authorized: str = Depends(require_api_key)):
+    client = get_redis()
+    try:
+        data = client.hgetall(f"{USAGE_KEY_PREFIX}{identity}")
+    except RedisError as exc:
+        raise HTTPException(500, detail=f"Failed to load usage: {exc}") from exc
+    if not data:
+        raise HTTPException(404, detail="usage not found")
+
+    usage: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key in {"requests", "prompt_tokens", "completion_tokens"}:
+            try:
+                usage[key] = int(value)
+            except (TypeError, ValueError):
+                usage[key] = value
+        else:
+            usage[key] = value
+    return {"identity": identity, "usage": usage}
+
+
+@app.get("/runs")
+def list_runs(
+    tag: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+    authorized: str = Depends(require_api_key),
+):
+    runs = _list_runs(tag, limit)
+    return {"runs": runs, "count": len(runs), "tag": tag, "limit": limit}
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
@@ -614,10 +764,21 @@ def _parse_auto_fix_completion(text: str) -> Dict[str, Any]:
         status = "unparsed"
 
     actions_raw = parsed.get("actions") or parsed.get("action_items") or []
+    action_objects: List[Dict[str, Any]] = []
     if isinstance(actions_raw, str):
         actions = [actions_raw.strip()]
     else:
-        actions = [str(item) for item in actions_raw if item is not None]
+        actions = []
+        for item in actions_raw:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                action_objects.append(item)
+                summary = item.get("description") or item.get("summary")
+                if summary:
+                    actions.append(str(summary))
+                    continue
+            actions.append(str(item))
 
     fix_instructions = parsed.get("fix_instructions") or parsed.get("resolution") or ""
     summary = parsed.get("summary") or parsed.get("analysis") or ""
@@ -627,6 +788,7 @@ def _parse_auto_fix_completion(text: str) -> Dict[str, Any]:
         "status": status,
         "summary": summary,
         "actions": actions,
+        "action_objects": action_objects,
         "fix_instructions": fix_instructions,
         "metrics": metrics,
         "parsed": parsed,
@@ -744,6 +906,7 @@ def _build_auto_fix_fix_request(
     actions_blob = _format_actions([str(step) for step in analysis.get("actions", [])])
     plan_blob = _safe_json_dumps(analysis.get("parsed") or {})
     remediation = analysis.get("fix_instructions") or analysis.get("summary") or ""
+    tool_results_blob = _safe_json_dumps(analysis.get("tool_results") or [])
 
     fix_req.user_input = "\n\n".join(
         section
@@ -753,6 +916,7 @@ def _build_auto_fix_fix_request(
             f"Latest error log:\n{auto_req.error_log}",
             f"Analysis summary:\n{analysis.get('summary', '')}",
             f"Action steps:\n{actions_blob}",
+            f"Tool execution results:\n{tool_results_blob}",
             f"Remediation plan:\n{remediation}",
             f"Structured response:\n{plan_blob}",
             "</auto_fix_context>",
@@ -764,7 +928,73 @@ def _build_auto_fix_fix_request(
     return fix_req
 
 
-def run_auto_fix(auto_req: AutoFixRequest) -> Dict[str, Any]:
+def _execute_tool_action(tool_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    client = get_redis()
+    try:
+        stored = client.hget(TOOLS_KEY, tool_name)
+    except RedisError as exc:
+        return {"status": "error", "error": f"Failed to load tool: {exc}"}
+
+    if not stored:
+        return {"status": "error", "error": "Tool not registered"}
+
+    try:
+        spec = json.loads(stored)
+    except json.JSONDecodeError:
+        spec = {"name": tool_name}
+
+    runner = spec.get("runner") or {}
+    if not runner and spec.get("endpoint"):
+        runner = {
+            "type": "http",
+            "url": spec.get("endpoint"),
+            "method": spec.get("method", "POST"),
+            "headers": spec.get("headers"),
+            "timeout": spec.get("timeout"),
+        }
+
+    if isinstance(runner, dict) and str(runner.get("type", "http")).lower() == "http":
+        method = str(runner.get("method", "POST")).upper()
+        url = runner.get("url") or runner.get("endpoint")
+        if not url:
+            return {"status": "error", "error": "HTTP runner missing URL"}
+        headers = runner.get("headers") or {}
+        timeout = runner.get("timeout") or spec.get("timeout") or DEFAULT_TOOL_TIMEOUT
+        try:
+            response = requests.request(
+                method,
+                url,
+                json=payload,
+                headers=headers,
+                timeout=float(timeout),
+            )
+        except requests.RequestException as exc:
+            return {"status": "error", "error": str(exc), "tool": tool_name}
+
+        content_type = response.headers.get("content-type", "")
+        body: Any
+        if "application/json" in content_type.lower():
+            try:
+                body = response.json()
+            except ValueError:
+                body = response.text
+        else:
+            try:
+                body = response.json()
+            except ValueError:
+                body = response.text
+
+        return {
+            "status": "ok" if response.ok else "error",
+            "http_status": response.status_code,
+            "body": body,
+            "tool": tool_name,
+        }
+
+    return {"status": "skipped", "error": "Unsupported tool runner", "tool": tool_name}
+
+
+def run_auto_fix(auto_req: AutoFixRequest, usage_identity: Optional[str] = None) -> Dict[str, Any]:
     base_req = _resolve_auto_fix_base_request(auto_req)
 
     attempts: List[Dict[str, Any]] = []
@@ -778,7 +1008,7 @@ def run_auto_fix(auto_req: AutoFixRequest) -> Dict[str, Any]:
         )
 
         print(f"Running analysis infer (task: {analysis_req.task})...")
-        analysis_result = run_inference(analysis_req)
+        analysis_result = run_inference(analysis_req, usage_identity=usage_identity)
         parsed_analysis = _parse_auto_fix_completion(
             analysis_result["output"].get("completion", "")
         )
@@ -788,12 +1018,27 @@ def run_auto_fix(auto_req: AutoFixRequest) -> Dict[str, Any]:
             f"{parsed_analysis.get('status', 'unknown')}, Summary: {summary_preview[:100]}..."
         )
 
+        tool_results: List[Dict[str, Any]] = []
+        for action in parsed_analysis.get("action_objects", []) or []:
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("type", "")).lower() != "tool":
+                continue
+            tool_name = action.get("tool") or action.get("name")
+            if not tool_name:
+                continue
+            tool_input = action.get("input") or action.get("payload") or {}
+            result = _execute_tool_action(str(tool_name), tool_input)
+            tool_results.append({"tool": tool_name, "input": tool_input, "result": result})
+        parsed_analysis["tool_results"] = tool_results
+
         attempt_record: Dict[str, Any] = {
             "attempt": attempt,
             "analysis_run_id": analysis_result.get("run_id"),
             "analysis": parsed_analysis,
             "fix_run_id": None,
             "fix_output": None,
+            "tool_results": tool_results,
         }
         attempts.append(attempt_record)
         prior_analyses.append(parsed_analysis)
@@ -802,6 +1047,10 @@ def run_auto_fix(auto_req: AutoFixRequest) -> Dict[str, Any]:
 
         if final_status == "unrecoverable":
             print("Analysis determined issue is unrecoverable. Stopping.")
+            break
+
+        if final_status == "needs_human_review":
+            print("Analysis requested human review. Pausing automation loop.")
             break
 
         has_actions = bool(parsed_analysis.get("fix_instructions") or parsed_analysis.get("actions"))
@@ -813,7 +1062,7 @@ def run_auto_fix(auto_req: AutoFixRequest) -> Dict[str, Any]:
         if final_status == "apply_fix":
             fix_req = _build_auto_fix_fix_request(base_req, auto_req, parsed_analysis)
             print(f"Running fix infer (task: {fix_req.task})...")
-            fix_result = run_inference(fix_req)
+            fix_result = run_inference(fix_req, usage_identity=usage_identity)
             attempt_record["fix_run_id"] = fix_result.get("run_id")
             attempt_record["fix_output"] = fix_result.get("output")
             print(f"Fix attempt complete. Run ID: {fix_result.get('run_id')}")
@@ -829,8 +1078,11 @@ def run_auto_fix(auto_req: AutoFixRequest) -> Dict[str, Any]:
     }
 
 
-def run_inference(req: InferRequest) -> Dict[str, Any]:
+def run_inference(
+    req: InferRequest, usage_identity: Optional[str] = None, stream: bool = False
+) -> Dict[str, Any]:
     client = get_redis()
+    normalized_tags = _normalize_tags(req.tags)
     context_blob = ""
     for cid in req.context_ids:
         latest = _latest_memory_version(client, cid)
@@ -887,38 +1139,67 @@ def run_inference(req: InferRequest) -> Dict[str, Any]:
         },
     }
 
-    output = call_llm(prompt, req, tool_specs, retrieved_contexts)
+    try:
+        output = call_llm(prompt, req, tool_specs, retrieved_contexts, stream=stream)
+    except TypeError:
+        output = call_llm(prompt, req, tool_specs, retrieved_contexts)
+        if isinstance(output, dict) and "completion_tokens" not in output:
+            output["completion_tokens"] = list(
+                TOKENIZER.iter_tokens(output.get("completion", ""))
+            )
 
     manifest = {
-        "request": req.dict(),
+        "request": req.model_dump(),
         "prompt": prompt,
         "output": output,
         "tools_used": tool_names,
         "retrievals": retrieved_contexts,
         "ts": time.time(),
+        "tags": normalized_tags,
+        "metadata": req.metadata,
     }
     run_id = save_run(manifest)
+    identity = usage_identity or req.usage_identifier
+    _record_usage(identity, prompt["tokens_used"], output, run_id)
     return {
         "run_id": run_id,
         "output": output,
-        "budgets": req.budget.dict(),
+        "budgets": req.budget.model_dump(),
         "used_context_chars": len(ctx_b),
         "used_tokens": prompt["tokens_used"],
         "retrievals": retrieved_contexts,
         "tools_considered": tool_names,
+        "tags": normalized_tags,
+        "metadata": req.metadata,
     }
 
 
 @app.post("/infer")
-def infer(req: InferRequest, authorized: bool = Depends(require_api_key)):
-    return run_inference(req)
+def infer(
+    req: InferRequest,
+    authorized: str = Depends(require_api_key),
+    stream: Optional[bool] = Query(default=None, description="Stream the completion token-by-token"),
+):
+    use_stream = req.stream or bool(stream)
+    result = run_inference(req, usage_identity=req.usage_identifier or authorized, stream=use_stream)
+    if not use_stream:
+        return result
+
+    tokens = result["output"].get("completion_tokens") or []
+
+    def _stream() -> Iterator[str]:
+        for token in tokens:
+            yield json.dumps({"token": token}) + "\n"
+        yield json.dumps({"event": "completed", "run_id": result["run_id"], "output": result["output"]}) + "\n"
+
+    return StreamingResponse(_stream(), media_type="application/json")
 
 
 @app.post("/infer/{run_id}/retry")
 def infer_retry(
     run_id: str,
     retry_req: RetryRequest,
-    authorized: bool = Depends(require_api_key),
+    authorized: str = Depends(require_api_key),
 ):
     client = get_redis()
 
@@ -957,9 +1238,138 @@ def infer_retry(
     original_req.user_input = error_context_block + original_user_input
 
     print(f"Retrying run {run_id}. Added error context to user input.")
-    return run_inference(original_req)
+    return run_inference(original_req, usage_identity=authorized)
 
 
 @app.post("/infer/auto-fix")
-def infer_auto_fix(auto_req: AutoFixRequest, authorized: bool = Depends(require_api_key)):
-    return run_auto_fix(auto_req)
+def infer_auto_fix(auto_req: AutoFixRequest, authorized: str = Depends(require_api_key)):
+    return run_auto_fix(auto_req, usage_identity=auto_req.usage_identifier or authorized)
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui_index(request: Request, authorized: str = Depends(require_api_key)):
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/ui/runs", response_class=HTMLResponse)
+def ui_runs(
+    request: Request,
+    tag: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+    authorized: str = Depends(require_api_key),
+):
+    runs = _list_runs(tag, limit)
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse(
+        "runs.html",
+        {"request": request, "runs": runs, "tag": tag, "limit": limit},
+    )
+
+
+@app.get("/ui/runs/{run_id}", response_class=HTMLResponse)
+def ui_run_detail(run_id: str, request: Request, authorized: str = Depends(require_api_key)):
+    client = get_redis()
+    try:
+        payload = client.hget(RUNS_KEY, run_id)
+    except RedisError as exc:
+        raise HTTPException(500, detail=f"Failed to load run: {exc}") from exc
+    if not payload:
+        raise HTTPException(404, "run not found")
+    try:
+        manifest = json.loads(payload)
+    except json.JSONDecodeError:
+        manifest = {"error": "Stored manifest is not valid JSON", "raw": payload}
+
+    manifest_pretty = json.dumps(manifest, indent=2, default=str)
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse(
+        "run_detail.html",
+        {"request": request, "run_id": run_id, "manifest": manifest, "manifest_json": manifest_pretty},
+    )
+
+
+@app.get("/ui/memory", response_class=HTMLResponse)
+def ui_memory(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    authorized: str = Depends(require_api_key),
+):
+    entries = _list_memory_entries(limit)
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse(
+        "memory.html", {"request": request, "entries": entries, "limit": limit}
+    )
+
+
+@app.get("/ui/memory/{memory_id}", response_class=HTMLResponse)
+def ui_memory_detail(memory_id: str, request: Request, authorized: str = Depends(require_api_key)):
+    client = get_redis()
+    key = f"{MEMORY_KEY_PREFIX}{memory_id}"
+    try:
+        history = client.lrange(key, 0, -1)
+    except RedisError as exc:
+        raise HTTPException(500, detail=f"Failed to load memory: {exc}") from exc
+
+    versions: List[Dict[str, Any]] = []
+    for idx, payload in enumerate(history):
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            data = {"data": payload, "ts": None}
+        versions.append({"version": idx, "payload": data})
+
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse(
+        "memory_detail.html",
+        {"request": request, "memory_id": memory_id, "versions": list(reversed(versions))},
+    )
+
+
+@app.get("/ui/infer", response_class=HTMLResponse)
+def ui_infer_form(request: Request, authorized: str = Depends(require_api_key)):
+    sample_payload = {
+        "task": "summarize_incident",
+        "user_input": "Summarize the latest incident log entry.",
+        "tags": ["demo"],
+    }
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse(
+        "infer_form.html",
+        {
+            "request": request,
+            "sample_payload": json.dumps(sample_payload, indent=2),
+        },
+    )
+
+
+@app.get("/ui/auto-fix", response_class=HTMLResponse)
+def ui_auto_fix_form(request: Request, authorized: str = Depends(require_api_key)):
+    sample_payload = {
+        "error_log": "Traceback (most recent call last): ...",
+        "request": {
+            "task": "repair_pipeline",
+            "user_input": "Original request body",
+        },
+    }
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse(
+        "auto_fix_form.html",
+        {
+            "request": request,
+            "sample_payload": json.dumps(sample_payload, indent=2),
+        },
+    )
+
+
+@app.get("/ui/usage", response_class=HTMLResponse)
+def ui_usage(request: Request, authorized: str = Depends(require_api_key)):
+    tmpl = _get_templates()
+    return tmpl.TemplateResponse("usage.html", {"request": request})
+def _get_templates() -> Jinja2Templates:
+    if templates is None:
+        raise HTTPException(
+            503,
+            detail="Template rendering requires the optional 'jinja2' dependency.",
+        )
+    return templates

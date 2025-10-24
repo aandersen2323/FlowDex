@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Manual Inference</h2>
+<p class="muted">Send ad-hoc /infer requests directly from the control panel.</p>
+<form data-endpoint="/infer" data-method="POST">
+  <label>
+    API Key (optional)
+    <input type="text" name="api_key" placeholder="sk-..." />
+  </label>
+  <label>
+    Request Payload (JSON)
+    <textarea name="payload" rows="12">{{ sample_payload }}</textarea>
+  </label>
+  <button type="submit">Send Request</button>
+  <div class="output" data-output></div>
+</form>
+{% endblock %}
